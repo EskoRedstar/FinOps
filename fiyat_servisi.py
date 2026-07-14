@@ -106,13 +106,14 @@ def _parse_try_number(raw) -> float:
 # ============================================================
 
 async def fetch_btc(client: httpx.AsyncClient):
-    """Binance, bazı bulut sağlayıcı bölgelerinden erişimi 451 (coğrafi kısıtlama)
-    ile engelliyor — bu yüzden CoinGecko kullanıyoruz (anahtar gerekmez, geniş
-    coğrafi erişime sahip)."""
+    """Birincil kaynak CoinGecko; rate limit (429) veya hata durumunda
+    Coinbase'in genel spot fiyat uç noktasına düşer. İkisi de anahtar
+    gerektirmez ve Binance'in aksine coğrafi kısıtlama uygulamaz."""
     try:
         r = await client.get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={"ids": "bitcoin", "vs_currencies": "usd", "include_24hr_change": "true"},
+            headers={"User-Agent": "EskoApp/1.0 (+https://esko.app)"},
             timeout=10,
         )
         r.raise_for_status()
@@ -123,8 +124,25 @@ async def fetch_btc(client: httpx.AsyncClient):
         if price is None:
             raise ValueError(f"beklenmeyen yanıt: {data}")
         _set("BTC", float(price), "USD", float(change or 0), "CoinGecko")
+        return
     except Exception as e:
-        _mark_stale("BTC", str(e))
+        coingecko_error = str(e)
+
+    # Yedek kaynak: Coinbase (change_pct vermez, son bilinen değişim korunur)
+    try:
+        r = await client.get(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            headers={"User-Agent": "EskoApp/1.0 (+https://esko.app)"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        amount = r.json().get("data", {}).get("amount")
+        if amount is None:
+            raise ValueError("Coinbase yanıtında fiyat yok")
+        prev_change = CACHE.get("BTC", {}).get("change_pct") or 0
+        _set("BTC", float(amount), "USD", prev_change, "Coinbase (yedek)")
+    except Exception as e2:
+        _mark_stale("BTC", f"CoinGecko: {coingecko_error} | Coinbase: {e2}")
 
 
 async def fetch_finnhub_quote(client: httpx.AsyncClient, symbol: str):
@@ -249,7 +267,7 @@ async def on_startup():
     # açılışta bir kez hepsini çek, sonra periyodik devam et
     await asyncio.gather(job_btc(), job_stocks(), job_metals(), job_tefas())
 
-    scheduler.add_job(job_btc, "interval", minutes=1, id="btc")
+    scheduler.add_job(job_btc, "interval", minutes=3, id="btc")  # CoinGecko ücretsiz katman rate limit'i için seyreltildi
     scheduler.add_job(job_stocks, "interval", minutes=2, id="stocks")   # Finnhub ücretsiz katman limiti düşünülerek
     scheduler.add_job(job_metals, "interval", minutes=5, id="metals")
     scheduler.add_job(job_tefas, "cron", hour=19, minute=0, id="tefas")  # TEFAS fiyatı akşam açıklanır
