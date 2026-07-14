@@ -36,6 +36,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fiyat_servisi")
 
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
+FONOLOJI_API_KEY = os.environ.get("FONOLOJI_API_KEY", "")
 TEFAS_FUND_CODE = os.environ.get("TEFAS_FUND_CODE", "YPT")  # Yapı Kredi Para Piyasası Fonu
 
 app = FastAPI(title="ESKO Fiyat Servisi")
@@ -85,16 +86,43 @@ def _mark_stale(symbol: str, error: str):
     log.warning(f"{symbol} güncellenemedi: {error}")
 
 
+def _parse_try_number(raw) -> float:
+    """Türkçe sayı formatını (binlik ayraç '.', ondalık ayraç ',') güvenle
+    float'a çevirir. Örn: '6.082,74' -> 6082.74. '%' işaretini de temizler.
+    Zaten standart formatta ('6082.74') gelen değerleri de doğru işler."""
+    s = str(raw).strip().replace("%", "").replace(" ", "")
+    if not s:
+        raise ValueError("boş değer")
+    if "," in s and "." in s:
+        # '.' binlik ayraç, ',' ondalık ayraç (Türkçe format)
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    return float(s)
+
+
 # ============================================================
 # Kaynak entegrasyonları
 # ============================================================
 
 async def fetch_btc(client: httpx.AsyncClient):
+    """Binance, bazı bulut sağlayıcı bölgelerinden erişimi 451 (coğrafi kısıtlama)
+    ile engelliyor — bu yüzden CoinGecko kullanıyoruz (anahtar gerekmez, geniş
+    coğrafi erişime sahip)."""
     try:
-        r = await client.get("https://api.binance.com/api/v3/ticker/24hr", params={"symbol": "BTCUSDT"}, timeout=10)
+        r = await client.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd", "include_24hr_change": "true"},
+            timeout=10,
+        )
         r.raise_for_status()
         data = r.json()
-        _set("BTC", float(data["lastPrice"]), "USD", float(data["priceChangePercent"]), "Binance")
+        btc = data.get("bitcoin", {})
+        price = btc.get("usd")
+        change = btc.get("usd_24h_change")
+        if price is None:
+            raise ValueError(f"beklenmeyen yanıt: {data}")
+        _set("BTC", float(price), "USD", float(change or 0), "CoinGecko")
     except Exception as e:
         _mark_stale("BTC", str(e))
 
@@ -129,16 +157,34 @@ async def fetch_gold_silver(client: httpx.AsyncClient):
         gold = data.get("gram-altin") or data.get("GRA") or {}
         silver = data.get("gumus") or data.get("GUM") or {}
 
+        def _price_field(d):
+            for key in ("Selling", "Satış", "satis", "selling"):
+                if key in d:
+                    return d[key]
+            return None
+
+        def _change_field(d):
+            for key in ("Change", "Değişim", "degisim", "change"):
+                if key in d:
+                    return d[key]
+            return None
+
         if gold:
-            price = float(str(gold.get("Selling", gold.get("Satış", 0))).replace(",", "."))
-            change = float(str(gold.get("Change", gold.get("Değişim", 0))).replace(",", ".").replace("%", ""))
+            raw_price = _price_field(gold)
+            if raw_price is None:
+                raise ValueError(f"gram-altın fiyat alanı bulunamadı: {list(gold.keys())}")
+            price = _parse_try_number(raw_price)
+            change = _parse_try_number(_change_field(gold) or 0)
             _set("XAU", price, "TRY", change, "Truncgil")
         else:
             _mark_stale("XAU", "Truncgil yanıtında gram-altın bulunamadı")
 
         if silver:
-            price = float(str(silver.get("Selling", silver.get("Satış", 0))).replace(",", "."))
-            change = float(str(silver.get("Change", silver.get("Değişim", 0))).replace(",", ".").replace("%", ""))
+            raw_price = _price_field(silver)
+            if raw_price is None:
+                raise ValueError(f"gümüş fiyat alanı bulunamadı: {list(silver.keys())}")
+            price = _parse_try_number(raw_price)
+            change = _parse_try_number(_change_field(silver) or 0)
             _set("XAG", price, "TRY", change, "Truncgil")
         else:
             _mark_stale("XAG", "Truncgil yanıtında gümüş bulunamadı")
@@ -148,36 +194,28 @@ async def fetch_gold_silver(client: httpx.AsyncClient):
 
 
 async def fetch_tefas(client: httpx.AsyncClient, fund_code: str = TEFAS_FUND_CODE):
-    """TEFAS fiyatı günde bir kez (gün sonunda) açıklanır; bu fonksiyon son
-    yayınlanan değeri çeker."""
+    """YPT (ve diğer TEFAS fonları) için Fonoloji API kullanılıyor
+    (https://fonoloji.com/api-docs) — TEFAS'ın 2026'daki API değişikliğini
+    kendi içinde çözen, güncel bakımı yapılan bir servis. Ücretsiz anahtar:
+    https://fonoloji.com/kayit"""
+    if not FONOLOJI_API_KEY:
+        _mark_stale("YPT", "FONOLOJI_API_KEY tanımlı değil")
+        return
     try:
-        today = datetime.now().strftime("%d.%m.%Y")
-        r = await client.post(
-            "https://www.tefas.gov.tr/api/DB/BindHistoryInfo",
-            data={"fontip": "YAT", "fonkod": fund_code, "bastarih": today, "bittarih": today},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        r = await client.get(
+            f"https://fonoloji.com/v1/funds/{fund_code}",
+            headers={"X-API-Key": FONOLOJI_API_KEY},
             timeout=15,
         )
         r.raise_for_status()
-        rows = r.json().get("data", [])
-        if not rows:
-            # Bugün henüz yayınlanmadıysa (piyasa kapanmadan) son 5 günü dene
-            from datetime import timedelta
-            past = (datetime.now() - timedelta(days=5)).strftime("%d.%m.%Y")
-            r = await client.post(
-                "https://www.tefas.gov.tr/api/DB/BindHistoryInfo",
-                data={"fontip": "YAT", "fonkod": fund_code, "bastarih": past, "bittarih": today},
-                timeout=15,
-            )
-            rows = r.json().get("data", [])
-        if not rows:
-            raise ValueError("TEFAS'tan veri dönmedi")
-        rows.sort(key=lambda x: x.get("TARIH", ""))
-        latest, prev = rows[-1], (rows[-2] if len(rows) > 1 else rows[-1])
-        price = float(latest["FIYAT"])
-        prev_price = float(prev["FIYAT"]) or price
-        change_pct = ((price - prev_price) / prev_price) * 100 if prev_price else 0
-        _set("YPT", price, "TRY", change_pct, "TEFAS")
+        data = r.json()
+        fund = data.get("fund", {})
+        price = fund.get("current_price")
+        return_1d = fund.get("return_1d")
+        if price is None:
+            raise ValueError(f"beklenmeyen yanıt: {data}")
+        change_pct = (return_1d or 0) * 100
+        _set("YPT", float(price), "TRY", change_pct, "Fonoloji")
     except Exception as e:
         _mark_stale("YPT", str(e))
 
