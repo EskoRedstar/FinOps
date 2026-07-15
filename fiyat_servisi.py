@@ -175,6 +175,7 @@ async def fetch_gold_silver(client: httpx.AsyncClient):
 
         gold = data.get("gram-altin") or data.get("GRA") or {}
         silver = data.get("gumus") or data.get("GUM") or {}
+        usd = data.get("dolar") or data.get("USD") or {}
 
         def _price_field(d):
             for key in ("Selling", "Satış", "satis", "selling"):
@@ -207,9 +208,36 @@ async def fetch_gold_silver(client: httpx.AsyncClient):
             _set("XAG", price, "TRY", change, "Truncgil")
         else:
             _mark_stale("XAG", "Truncgil yanıtında gümüş bulunamadı")
+
+        # USD/TRY kurunu aynı yanıttan çek (ekstra istek yok)
+        if usd:
+            raw_usd = _price_field(usd)
+            if raw_usd:
+                _set("USDTRY", _parse_try_number(raw_usd), "TRY",
+                     _parse_try_number(_change_field(usd) or 0), "Truncgil")
+        else:
+            await _fetch_usdtry_fallback(client)
+
     except Exception as e:
         _mark_stale("XAU", str(e))
         _mark_stale("XAG", str(e))
+        await _fetch_usdtry_fallback(client)
+
+
+async def _fetch_usdtry_fallback(client: httpx.AsyncClient):
+    """Truncgil'de USD/TRY yoksa ExchangeRate-API'ye düşer (anahtar gerekmez)."""
+    try:
+        r = await client.get(
+            "https://api.exchangerate-api.com/v4/latest/USD", timeout=10
+        )
+        r.raise_for_status()
+        rate = r.json().get("rates", {}).get("TRY")
+        if rate:
+            prev = CACHE.get("USDTRY", {}).get("price") or rate
+            change_pct = ((rate - prev) / prev) * 100 if prev else 0
+            _set("USDTRY", float(rate), "TRY", change_pct, "ExchangeRate-API")
+    except Exception as e:
+        _mark_stale("USDTRY", str(e))
 
 
 async def fetch_fund(client: httpx.AsyncClient, symbol: str, fund_code: str):
@@ -323,7 +351,7 @@ async def get_price(symbol: str):
 async def force_refresh(symbol: str):
     """Belirli bir sembolü zamanlamayı beklemeden hemen tazeler (manuel test için)."""
     symbol = symbol.upper()
-    jobs = {"BTC": job_btc, "MSTR": job_stocks, "TMQ": job_stocks, "XAU": job_metals, "XAG": job_metals, "YPT": job_tefas, "HMG": job_tefas}
+    jobs = {"BTC": job_btc, "MSTR": job_stocks, "TMQ": job_stocks, "XAU": job_metals, "XAG": job_metals, "USDTRY": job_metals, "YPT": job_tefas, "HMG": job_tefas}
     if symbol not in jobs:
         raise HTTPException(404, f"'{symbol}' tanınmıyor.")
     await jobs[symbol]()
