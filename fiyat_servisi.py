@@ -38,6 +38,7 @@ log = logging.getLogger("fiyat_servisi")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 FONOLOJI_API_KEY = os.environ.get("FONOLOJI_API_KEY", "")
 TEFAS_FUND_CODE = os.environ.get("TEFAS_FUND_CODE", "YPT")  # Yapı Kredi Para Piyasası Fonu
+HMG_FUND_CODE = os.environ.get("HMG_FUND_CODE", "HMG")      # HSBC Portföy Para Piyasası Fonu
 
 app = FastAPI(title="ESKO Fiyat Servisi")
 
@@ -211,13 +212,13 @@ async def fetch_gold_silver(client: httpx.AsyncClient):
         _mark_stale("XAG", str(e))
 
 
-async def fetch_tefas(client: httpx.AsyncClient, fund_code: str = TEFAS_FUND_CODE):
-    """YPT (ve diğer TEFAS fonları) için Fonoloji API kullanılıyor
+async def fetch_fund(client: httpx.AsyncClient, symbol: str, fund_code: str):
+    """TEFAS fonları (YPT, HMG vb.) için Fonoloji API kullanılıyor
     (https://fonoloji.com/api-docs) — TEFAS'ın 2026'daki API değişikliğini
     kendi içinde çözen, güncel bakımı yapılan bir servis. Ücretsiz anahtar:
     https://fonoloji.com/kayit"""
     if not FONOLOJI_API_KEY:
-        _mark_stale("YPT", "FONOLOJI_API_KEY tanımlı değil")
+        _mark_stale(symbol, "FONOLOJI_API_KEY tanımlı değil")
         return
     try:
         r = await client.get(
@@ -233,9 +234,9 @@ async def fetch_tefas(client: httpx.AsyncClient, fund_code: str = TEFAS_FUND_COD
         if price is None:
             raise ValueError(f"beklenmeyen yanıt: {data}")
         change_pct = (return_1d or 0) * 100
-        _set("YPT", float(price), "TRY", change_pct, "Fonoloji")
+        _set(symbol, float(price), "TRY", change_pct, "Fonoloji")
     except Exception as e:
-        _mark_stale("YPT", str(e))
+        _mark_stale(symbol, str(e))
 
 
 # ============================================================
@@ -259,7 +260,10 @@ async def job_metals():
 
 async def job_tefas():
     async with httpx.AsyncClient() as c:
-        await fetch_tefas(c)
+        await asyncio.gather(
+            fetch_fund(c, "YPT", TEFAS_FUND_CODE),
+            fetch_fund(c, "HMG", HMG_FUND_CODE),
+        )
 
 
 @app.on_event("startup")
@@ -319,7 +323,7 @@ async def get_price(symbol: str):
 async def force_refresh(symbol: str):
     """Belirli bir sembolü zamanlamayı beklemeden hemen tazeler (manuel test için)."""
     symbol = symbol.upper()
-    jobs = {"BTC": job_btc, "MSTR": job_stocks, "TMQ": job_stocks, "XAU": job_metals, "XAG": job_metals, "YPT": job_tefas}
+    jobs = {"BTC": job_btc, "MSTR": job_stocks, "TMQ": job_stocks, "XAU": job_metals, "XAG": job_metals, "YPT": job_tefas, "HMG": job_tefas}
     if symbol not in jobs:
         raise HTTPException(404, f"'{symbol}' tanınmıyor.")
     await jobs[symbol]()
